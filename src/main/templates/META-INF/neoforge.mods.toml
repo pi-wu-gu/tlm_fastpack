@@ -1,0 +1,44 @@
+modLoader="javafml"
+loaderVersion="${loader_version_range}"
+license="${mod_license}"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+authors="pi-wu-gu"
+description='''
+TLM FastPack —— 跳过 Touhou Little Maid 每次启动对默认资源包（1260 文件 / 41MB）的
+无条件重拷。实测该拷贝走 FML UnionFileSystem，每次耗时 8-19 分钟；
+本 mod 在内容未变化时直接短路，把这一步降到毫秒级。
+
+· 首次启动 / TLM 升级 / 目录损坏时自动回退全量拷贝，无人工干预
+· 模组设置（Mods → TLM FastPack → 配置）里可勾选「下次启动强制重拷」
+· 注入失败时优雅降级（expect 模式），最坏情况 = 恢复上游行为
+'''
+
+# mixin 配置：目标是 TLM 自己的类（非 MC 混淆类），无需 refmap
+[[mixins]]
+config="${mod_id}.mixins.json"
+
+[[dependencies.${mod_id}]]
+    modId="neoforge"
+    type="required"
+    versionRange="[${neo_version},)"
+    ordering="NONE"
+    side="CLIENT"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    type="required"
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="CLIENT"
+
+# TLM 是可选依赖：不装它时本 mod 空转；装了才生效
+[[dependencies.${mod_id}]]
+    modId="touhou_little_maid"
+    type="optional"
+    versionRange="[1.5.3,)"
+    ordering="AFTER"
+    side="CLIENT"

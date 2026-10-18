@@ -1,0 +1,10 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "net.tlmfastpack.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["FastPackMixin"],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

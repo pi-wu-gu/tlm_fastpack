@@ -415,7 +415,18 @@ public final class PackState {
         long ms = (System.nanoTime() - t0) / 1_000_000;
         TlmFastPack.LOG.info("[TLM FastPack] 快速同步完成：核对 {} 条 / 拷贝 {} 条 / 耗时 {} ms（{}）",
                 checked, copied, ms, fullOverwrite ? "全量重建" : "增量");
+        clearResetState();
         return true;
+    }
+
+    /** 清除 reset 状态：标记文件 + 配置值（快速通道成功与上游收尾共用）。 */
+    private static void clearResetState() {
+        try {
+            Files.deleteIfExists(resetFlagFile());
+        } catch (Throwable ignored) {
+        }
+        FastPackConfig.clearResetFlagInConfig();
+        rewriteTomlFlagFallback();
     }
 
     private static void writeMarker(Path target, JarManifest jm) {
@@ -466,12 +477,7 @@ public final class PackState {
         } else {
             TlmFastPack.LOG.warn("[TLM FastPack] 收尾统计失败——marker 未写，下次启动仍会同步");
         }
-        try {
-            Files.deleteIfExists(resetFlagFile());
-        } catch (Throwable ignored) {
-        }
-        FastPackConfig.clearResetFlagInConfig();
-        rewriteTomlFlagFallback();
+        clearResetState();
     }
 
     public static void markCancelled() {

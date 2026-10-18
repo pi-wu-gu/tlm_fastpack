@@ -37,6 +37,10 @@ TLM 的 `CommonDefaultPack.initCommonDefaultPack()` 每次启动都把 jar 内�
 本机删一个文件实测 2.6 秒——这也是上游全量拷贝慢的另一半根源。
 改用 CREATE+TRUNCATE_EXISTING 截断覆写后，全量重建从 21.8 分钟降到 14 秒。
 
+★v1.1.2 修复：快速通道成功后同步清除 reset 状态（原只在 RETURN 收尾清，
+被 ThreadLocal 去重跳过——`resetNextLaunch` 勾选后第一次启动走完全量重拷，
+marker 里 reset 标志未清，第二次启动又被强制重拷一次）。
+
 注：本 mod 是独立模组，版本线 1.x 自行递增，与主模组 aiplayer 的 0.2.1.x 版本线互不相干。
 
 ## 兼容性
@@ -48,5 +52,5 @@ TLM 的 `CommonDefaultPack.initCommonDefaultPack()` 每次启动都把 jar 内�
 ## 构建
 
 ```bash
-./gradlew build   # 产物 build/libs/tlm_fastpack-1.0.0.jar，丢进 mods/ 即用
+./gradlew build   # 产物 build/libs/tlm_fastpack-<version>.jar（当前 1.1.2），丢进 mods/ 即用
 ```

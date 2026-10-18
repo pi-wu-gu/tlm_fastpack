@@ -1,6 +1,5 @@
 package net.tlmfastpack;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -9,26 +8,36 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
+import java.nio.file.StandardCopyOption;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Properties;
 import java.util.stream.Stream;
+import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.loading.FMLPaths;
 import net.neoforged.neoforgespi.language.IModFileInfo;
-import net.neoforged.neoforgespi.locating.IModFile;
 
 /**
- * 跳过判定的全部状态：marker 文件 + reset 标记文件 + jar 侧统计。
+ * 跳过/快速同步判定的全部状态（v1.1）。
  *
- * <p>设计原则（见兼容性分析文档）：
+ * <p>v1.1 关键升级（前提均已字节码核实）：
  * <ul>
- *   <li><strong>mixin 只读文件、不读配置</strong>——配置加载时序不可控，文件 IO 无时序问题；</li>
- *   <li>所有条件不满足时一律放行上游逻辑（全量拷贝），<strong>失败模式 = 回到现状</strong>；</li>
- *   <li>全量拷贝完成后由 mixin 收尾重建 marker → 下次恢复跳过（自愈链）。</li>
+ *   <li>上游 {@code copyFolder} <strong>只覆盖、从不删除</strong>（0 处 delete）
+ *       → "只拷差异"与"全量覆盖"最终产物<strong>完全等价</strong>；</li>
+ *   <li>zip 中央目录自带每条目 size+CRC32（不解压可读）→ 逐条比对成本 ≈ 读 41MB 算 CRC。</li>
  * </ul>
+ * 因此 HEAD 决策三态化：
+ * <ol>
+ *   <li>{@code SKIP}——磁盘与 jar 内容清单完全一致 → 直接取消（毫秒级）；</li>
+ *   <li>{@code SYNC}——需要更新 → cancel + 自己用 {@code ZipFile} 直读做<strong>增量同步</strong>
+ *       （走普通文件 IO，秒级；reset 时全量重建也是秒级）；</li>
+ *   <li>{@code DELEGATE}——无法判定/快速通道失败 → 放行上游（慢但正确，最坏=现状）。</li>
+ * </ol>
+ * 每个分支都有日志（v1.0.0 静默分支的教训）。
  */
 public final class PackState {
 
@@ -39,13 +48,25 @@ public final class PackState {
     /** 磁盘文件数低于该值视为目录不完整（当前默认包 1260 个文件）。 */
     private static final int MIN_FILES = 1000;
     private static final String MARKER_NAME = "tlm_fastpack.marker";
+    private static final String MANIFEST_NAME = "tlm_fastpack.manifest";
     private static final String RESET_FLAG_NAME = "tlm_fastpack_reset.flag";
+
+    /** HEAD cancel / 收尾去重标记（copyFolder 只会在一个线程上被调，ThreadLocal 足够）。 */
+    private static final ThreadLocal<Boolean> CANCELLED = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     private PackState() {
     }
 
-    /** jar 侧默认包统计（读 zip 中央目录，不解压、毫秒级）。 */
-    record JarStats(int count, long totalBytes) {
+    /** jar 侧默认包清单：条目数、未压缩总字节、逐条目 [size, crc]。 */
+    public record JarManifest(int count, long totalBytes, Map<String, long[]> entries) {
+    }
+
+    /** 判定结果。 */
+    public enum Action {
+        SKIP, SYNC, DELEGATE
+    }
+
+    public record Decision(Action action, String reason, boolean fullCopy) {
     }
 
     // ---------------------------------------------------------------- reset 标记
@@ -74,10 +95,14 @@ public final class PackState {
         }
     }
 
-    // ---------------------------------------------------------------- marker
+    // ---------------------------------------------------------------- marker / manifest
 
     private static Path markerFile(Path target) {
         return target.resolveSibling(MARKER_NAME);
+    }
+
+    private static Path manifestFile(Path target) {
+        return target.resolveSibling(MANIFEST_NAME);
     }
 
     private static Properties loadMarker(Path target) {
@@ -94,9 +119,46 @@ public final class PackState {
         }
     }
 
+    /** 读取上次同步时的 jar 侧内容清单（relPath → [size, crc]）。缺失/损坏返回 null。 */
+    private static Map<String, long[]> loadManifest(Path target) {
+        Path f = manifestFile(target);
+        if (!Files.isRegularFile(f)) {
+            return null;
+        }
+        try {
+            Map<String, long[]> m = new LinkedHashMap<>();
+            for (String line : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
+                String[] parts = line.split("\t");
+                if (parts.length != 3) {
+                    return null;
+                }
+                m.put(parts[0], new long[]{Long.parseLong(parts[1]), Long.parseLong(parts[2])});
+            }
+            return m.isEmpty() ? null : m;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean manifestEquals(Map<String, long[]> saved, Map<String, long[]> current) {
+        if (saved.size() != current.size()) {
+            return false;
+        }
+        for (Map.Entry<String, long[]> e : current.entrySet()) {
+            long[] d = saved.get(e.getKey());
+            if (d == null || d[0] != e.getValue()[0] || d[1] != e.getValue()[1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // ---------------------------------------------------------------- 统计
 
-    /** TLM 的 mod 版本号（用于 marker：版本变了强制重拷一次）。 */
+    /** TLM 的 mod 版本号（marker 记录用；v1.1 起版本变化不再强制全拷，只影响日志与追踪）。 */
     static String tlmVersion() {
         try {
             return ModList.get().getModContainerById(TLM_MODID)
@@ -117,10 +179,10 @@ public final class PackState {
      * 定位 TLM 的 mod jar 文件。
      *
      * <p>★v1.0.0 踩坑：{@code getProtectionDomain().getCodeSource()} 在 SecureJar 下返回
-     * {@code union:} 协议 URI，{@code Paths.get()} 直接炸——首启没跳过就是它。
-     * 正解是走 FML 的 ModList 拿真实文件路径；codeSource 仅留作 file: 协议的后备。
+     * {@code union:} 协议 URI，{@code Paths.get()} 直接炸。正解是走 FML 的 ModList
+     * （注意 {@code getModFileById} 返回 {@code IModFileInfo}，路径方法是 {@code getFilePath()}）。
      */
-    private static Path tlmJarFile() {
+    static Path tlmJarFile() {
         try {
             IModFileInfo mfi = ModList.get().getModFileById(TLM_MODID);
             if (mfi != null && mfi.getFile() != null) {
@@ -152,10 +214,11 @@ public final class PackState {
         return null;
     }
 
-    /** 读 zip 中央目录统计默认包条目数与未压缩总字节（不解压）。失败返回 null → 不跳过。 */
-    static JarStats jarStats(String resource) {
+    /** 读 zip 中央目录构建 jar 侧内容清单（不解压，毫秒级）。 */
+    static JarManifest jarManifest(String resource) {
         Path jar = tlmJarFile();
         if (jar == null) {
+            TlmFastPack.LOG.debug("[TLM FastPack] 无法定位 TLM jar 文件");
             return null;
         }
         String prefix = resource.startsWith("/") ? resource.substring(1) : resource;
@@ -165,19 +228,21 @@ public final class PackState {
         try (ZipFile zf = new ZipFile(jar.toFile())) {
             int n = 0;
             long tot = 0L;
+            Map<String, long[]> entries = new LinkedHashMap<>();
             var en = zf.entries();
             while (en.hasMoreElements()) {
                 ZipEntry e = en.nextElement();
-                if (e.isDirectory()) {
+                if (e.isDirectory() || !e.getName().startsWith(prefix)) {
                     continue;
                 }
-                if (e.getName().startsWith(prefix)) {
-                    n++;
-                    tot += e.getSize();
-                }
+                String rel = e.getName().substring(prefix.length());
+                n++;
+                tot += e.getSize();
+                entries.put(rel, new long[]{e.getSize(), e.getCrc()});
             }
-            return n == 0 ? null : new JarStats(n, tot);
+            return n == 0 ? null : new JarManifest(n, tot, entries);
         } catch (IOException e) {
+            TlmFastPack.LOG.debug("[TLM FastPack] 读 jar 中央目录失败: {}", e.toString());
             return null;
         }
     }
@@ -190,84 +255,209 @@ public final class PackState {
         }
     }
 
+    /** 磁盘文件清单（relPath → size），只 stat 不读内容。 */
+    private static Map<String, Long> diskSizes(Path target) {
+        Map<String, Long> m = new LinkedHashMap<>();
+        try (Stream<Path> s = Files.walk(target)) {
+            s.filter(Files::isRegularFile).forEach(p -> {
+                try {
+                    m.put(target.relativize(p).toString().replace('\\', '/'), Files.size(p));
+                } catch (Throwable ignored) {
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+        return m;
+    }
+
+    private static long diskCrc(Path file) {
+        try (InputStream in = Files.newInputStream(file)) {
+            CRC32 crc = new CRC32();
+            byte[] buf = new byte[64 * 1024];
+            int r;
+            while ((r = in.read(buf)) >= 0) {
+                crc.update(buf, 0, r);
+            }
+            return crc.getValue();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
     // ---------------------------------------------------------------- 判定
 
     /**
-     * 判定是否可以跳过本次拷贝。★只对默认包资源调用（调用方先用 {@link #isDefaultPackResource} 过滤）。
+     * 三态判定。★只对默认包资源调用（调用方先用 {@link #isDefaultPackResource} 过滤）。
      */
     public static Decision decide(String resource, Path target) {
         if (FastPackConfig.disableSkip()) {
-            return new Decision(false, "紧急总闸 disableSkip=true，恢复上游行为");
+            return new Decision(Action.DELEGATE, "紧急总闸 disableSkip=true，恢复上游行为", false);
         }
-        if (FastPackConfig.resetRequested()) {
-            return new Decision(false, "reset 请求生效，本次强制全量重拷");
+        JarManifest jm = jarManifest(resource);
+        if (jm == null) {
+            return new Decision(Action.DELEGATE, "jar 定位/统计失败，交上游处理", false);
         }
         if (!Files.isDirectory(target)) {
-            return new Decision(false, "目标目录不存在（首次启动）");
+            return new Decision(Action.SYNC, "目标目录不存在（首次安装，直读 jar 建包）", false);
+        }
+        if (FastPackConfig.resetRequested()) {
+            return new Decision(Action.SYNC, "reset 请求生效（快速通道全量重建）", true);
         }
         int disk = diskCount(target);
         if (disk < MIN_FILES) {
-            return new Decision(false, "磁盘文件数 " + disk + " < " + MIN_FILES + "，目录不完整，全拷自愈");
+            return new Decision(Action.SYNC, "磁盘文件数 " + disk + " < " + MIN_FILES + "，增量补齐", false);
         }
         Properties m = loadMarker(target);
+        Map<String, long[]> manifest = loadManifest(target);
+        if (m != null && manifest != null
+                && tlmVersion().equals(m.getProperty("tlmVersion"))
+                && jm.count() == intOf(m, "entryCount")
+                && jm.totalBytes() == longOf(m, "totalBytes")
+                && manifestEquals(manifest, jm.entries())) {
+            // jar 与上次同步时一致 → 只需核对磁盘文件集合
+            Map<String, Long> diskMap = diskSizes(target);
+            boolean diskOk = diskMap.size() == manifest.size();
+            if (diskOk) {
+                for (Map.Entry<String, long[]> e : manifest.entrySet()) {
+                    Long ds = diskMap.get(e.getKey());
+                    if (ds == null || ds != e.getValue()[0]) {
+                        diskOk = false;
+                        break;
+                    }
+                }
+            }
+            if (diskOk) {
+                return new Decision(Action.SKIP,
+                        "磁盘与 TLM " + tlmVersion() + " 默认包完全一致（" + diskMap.size() + " 文件）", false);
+            }
+            return new Decision(Action.SYNC, "磁盘文件集与清单有差异（增量补齐）", false);
+        }
+        String why;
         if (m == null) {
-            return new Decision(false, "marker 缺失或损坏");
+            why = "marker 缺失";
+        } else if (manifest == null) {
+            why = "内容清单缺失（v1 → v1.1 升级）";
+        } else if (!tlmVersion().equals(m.getProperty("tlmVersion"))) {
+            why = "TLM 版本变化（" + m.getProperty("tlmVersion") + " → " + tlmVersion() + "）";
+        } else {
+            why = "jar 内默认包内容变化";
         }
-        if (!target.toAbsolutePath().toString().equals(m.getProperty("targetPath"))) {
-            return new Decision(false, "marker 记录的目标路径与当前不符");
-        }
-        if (!tlmVersion().equals(m.getProperty("tlmVersion"))) {
-            return new Decision(false, "TLM 版本变化（" + m.getProperty("tlmVersion") + " → " + tlmVersion() + "）");
-        }
-        int markerDisk = intOf(m, "diskCount");
-        if (markerDisk != disk) {
-            return new Decision(false, "磁盘文件数 " + disk + " ≠ marker 记录 " + markerDisk + "（用户增删过文件）");
-        }
-        JarStats js = jarStats(resource);
-        if (js == null) {
-            return new Decision(false, "jar 统计失败（定位或读取）");
-        }
-        if (js.count() != intOf(m, "entryCount") || js.totalBytes() != longOf(m, "totalBytes")) {
-            return new Decision(false, "jar 内默认包内容变化（" + js.count() + " 文件 / " + js.totalBytes() + " 字节）");
-        }
-        return new Decision(true, "目录与 TLM " + m.getProperty("tlmVersion") + " 默认包一致（" + disk + " 文件）");
+        return new Decision(Action.SYNC, why + "，增量同步", false);
     }
 
-    /** 判定结果：skip=true 时 reason 说明为何可跳过；skip=false 时 reason 说明为何必须全拷。 */
-    public record Decision(boolean skip, String reason) {
+    // ---------------------------------------------------------------- 快速同步
+
+    /**
+     * 直读 jar 做增量同步（走普通文件 IO，不走 UnionFileSystem）。
+     *
+     * @param fullOverwrite true=忽略差异全部重写（reset 语义）；false=只拷缺失/size/CRC 不一致的条目
+     * @return true=同步完成（调用方应 cancel 上游）；false=失败（调用方放行上游兜底）
+     */
+    public static boolean fastSync(String resource, Path target, boolean fullOverwrite) {
+        JarManifest jm = jarManifest(resource);
+        Path jar = tlmJarFile();
+        if (jm == null || jar == null) {
+            return false;
+        }
+        String prefix = resource.startsWith("/") ? resource.substring(1) : resource;
+        if (!prefix.endsWith("/")) {
+            prefix = prefix + "/";
+        }
+        long t0 = System.nanoTime();
+        int copied = 0;
+        int checked = 0;
+        try {
+            Files.createDirectories(target);
+            try (ZipFile zf = new ZipFile(jar.toFile())) {
+                var en = zf.entries();
+                while (en.hasMoreElements()) {
+                    ZipEntry e = en.nextElement();
+                    if (e.isDirectory() || !e.getName().startsWith(prefix)) {
+                        continue;
+                    }
+                    String rel = e.getName().substring(prefix.length());
+                    if (rel.isEmpty()) {
+                        continue;
+                    }
+                    checked++;
+                    Path out = target.resolve(rel);
+                    if (!fullOverwrite && Files.isRegularFile(out)) {
+                        boolean same = Files.size(out) == e.getSize();
+                        if (same) {
+                            // 同尺寸再看 CRC（内容变化的最后防线；全部读一遍约 0.3s）
+                            same = diskCrc(out) == e.getCrc();
+                        }
+                        if (same) {
+                            continue;
+                        }
+                    }
+                    Files.createDirectories(out.getParent());
+                    try (InputStream in = zf.getInputStream(e)) {
+                        Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                    copied++;
+                }
+            }
+        } catch (Throwable t) {
+            TlmFastPack.LOG.warn(
+                    "[TLM FastPack] 快速同步中途失败（已拷 {} 条）——本次放行上游兜底，下次启动会重试: {}",
+                    copied, t.toString());
+            return false;
+        }
+        writeMarker(target, jm);
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        TlmFastPack.LOG.info("[TLM FastPack] 快速同步完成：核对 {} 条 / 拷贝 {} 条 / 耗时 {} ms（{}）",
+                checked, copied, ms, fullOverwrite ? "全量重建" : "增量");
+        return true;
     }
 
-    /** 全量拷贝完成后调用：写 marker + 清 reset 标记（自愈链的重建点）。 */
+    private static void writeMarker(Path target, JarManifest jm) {
+        try {
+            int disk = diskCount(target);
+            Properties p = new Properties();
+            p.setProperty("targetPath", target.toAbsolutePath().toString());
+            p.setProperty("tlmVersion", tlmVersion());
+            p.setProperty("entryCount", String.valueOf(jm.count()));
+            p.setProperty("totalBytes", String.valueOf(jm.totalBytes()));
+            p.setProperty("diskCount", String.valueOf(disk));
+            Path mf = markerFile(target);
+            Files.createDirectories(mf.getParent());
+            try (OutputStream out = Files.newOutputStream(mf)) {
+                p.store(out, "TLM FastPack marker - auto generated, do not edit");
+            }
+            StringBuilder sb = new StringBuilder("#TLM FastPack manifest - auto generated, do not edit\n");
+            for (Map.Entry<String, long[]> e : jm.entries().entrySet()) {
+                sb.append(e.getKey()).append('\t').append(e.getValue()[0])
+                        .append('\t').append(e.getValue()[1]).append('\n');
+            }
+            Files.writeString(manifestFile(target), sb.toString(), StandardCharsets.UTF_8);
+            TlmFastPack.LOG.info("[TLM FastPack] marker/manifest 已写入（{} 文件 / {} 字节 / 清单 {} 条）",
+                    jm.count(), jm.totalBytes(), jm.entries().size());
+        } catch (Throwable t) {
+            TlmFastPack.LOG.warn("[TLM FastPack] 写 marker/manifest 失败（下次仍会同步，不影响功能）: {}", t.toString());
+        }
+    }
+
+    // ---------------------------------------------------------------- 收尾
+
+    /**
+     * RETURN 注入点：区分"我们自己取消/完成"（marker 已写）与"上游完成全量拷贝"（这里补写 marker）。
+     */
     public static void afterFullCopy(String resource, Path target) {
         if (!isDefaultPackResource(resource)) {
             return;
         }
-        JarStats js = jarStats(resource);
-        int disk = diskCount(target);
-        if (js != null && disk >= 0) {
-            try {
-                Properties p = new Properties();
-                p.setProperty("targetPath", target.toAbsolutePath().toString());
-                p.setProperty("tlmVersion", tlmVersion());
-                p.setProperty("entryCount", String.valueOf(js.count()));
-                p.setProperty("totalBytes", String.valueOf(js.totalBytes()));
-                p.setProperty("diskCount", String.valueOf(disk));
-                Path mf = markerFile(target);
-                Files.createDirectories(mf.getParent());
-                try (OutputStream out = Files.newOutputStream(mf)) {
-                    p.store(out, "TLM FastPack marker - auto generated, do not edit");
-                }
-                TlmFastPack.LOG.info(
-                        "[TLM FastPack] marker 已写入（{} 文件 / {} 字节）——下次启动若内容未变将直接跳过拷贝",
-                        js.count(), js.totalBytes());
-            } catch (Throwable t) {
-                TlmFastPack.LOG.warn("[TLM FastPack] 写 marker 失败（下次仍会全拷，不影响功能）: {}", t.toString());
-            }
+        if (CANCELLED.get()) {
+            CANCELLED.remove();
+            return; // 我们走完了快速通道，marker/manifest 已写
+        }
+        CANCELLED.remove();
+        // 上游完成了全量拷贝 → 重建 marker（自愈链）
+        JarManifest jm = jarManifest(resource);
+        if (jm != null) {
+            writeMarker(target, jm);
         } else {
-            // ★v1.0.0 教训：这里原来是静默分支，jar 定位失败根本看不出来
-            TlmFastPack.LOG.warn(
-                    "[TLM FastPack] 收尾统计失败（jar={} 磁盘={}）——marker 未写，下次启动仍会全量拷贝",
-                    js == null ? "定位失败" : "ok", disk);
+            TlmFastPack.LOG.warn("[TLM FastPack] 收尾统计失败——marker 未写，下次启动仍会同步");
         }
         try {
             Files.deleteIfExists(resetFlagFile());
@@ -275,6 +465,10 @@ public final class PackState {
         }
         FastPackConfig.clearResetFlagInConfig();
         rewriteTomlFlagFallback();
+    }
+
+    public static void markCancelled() {
+        CANCELLED.set(Boolean.TRUE);
     }
 
     /** 兜底：直接改 TOML 文本，确保 resetNextLaunch=false（防配置 API 时序问题）。 */

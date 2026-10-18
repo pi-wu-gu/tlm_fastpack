@@ -20,15 +20,16 @@ import net.tlmfastpack.TlmFastPack;
  *   <li>目标类是 <strong>mod 自己的类</strong>（非 MC 混淆类），无需 refmap，MC 版本升级无感；</li>
  *   <li>HEAD 处任何异常都被吞掉并放行原逻辑——<strong>最坏情况 = 回到上游慢路径</strong>。</li>
  * </ul>
+ *
+ * <p>v1.1：HEAD 决策三态化——
+ * {@code SKIP}（内容一致，毫秒级取消）／
+ * {@code SYNC}（cancel 后自己用 ZipFile 直读做增量同步，秒级；失败自动放行上游）／
+ * {@code DELEGATE}（放行上游）。
  */
 @Pseudo
 @Mixin(targets = "com.github.tartaricacid.touhoulittlemaid.util.GetJarResources")
 public abstract class FastPackMixin {
 
-    /**
-     * HEAD：内容未变化时直接取消拷贝（省 8-19 分钟）。
-     * ★跳过与不跳过都记 INFO——v1.0.0 两个静默分支排查了一整轮，这里必须可见。
-     */
     @Inject(method = "copyFolder(Ljava/lang/String;Ljava/nio/file/Path;)V",
             at = @At("HEAD"), cancellable = true, require = 0, expect = 0)
     private static void tlmfastpack$maybeSkip(String resource, Path target, CallbackInfo ci) {
@@ -37,20 +38,31 @@ public abstract class FastPackMixin {
                 return; // 只处理 TLM 默认包这一处，其他调用一概不碰、不打扰
             }
             PackState.Decision d = PackState.decide(resource, target);
-            if (d.skip()) {
-                TlmFastPack.LOG.info("[TLM FastPack] 已跳过默认包重拷（{}）——本次启动省 8-19 分钟", d.reason());
-                ci.cancel();
-            } else {
-                TlmFastPack.LOG.info("[TLM FastPack] 本次全量拷贝（{}）", d.reason());
+            switch (d.action()) {
+                case SKIP -> {
+                    TlmFastPack.LOG.info("[TLM FastPack] 已跳过默认包处理（{}）——省 8-19 分钟", d.reason());
+                    PackState.markCancelled();
+                    ci.cancel();
+                }
+                case SYNC -> {
+                    TlmFastPack.LOG.info("[TLM FastPack] {}——走快速通道（直读 jar，秒级）", d.reason());
+                    if (PackState.fastSync(resource, target, d.fullCopy())) {
+                        PackState.markCancelled();
+                        ci.cancel();
+                    } else {
+                        // fastSync 失败已 WARN；不 cancel → 上游全量拷贝兜底（慢但正确）
+                    }
+                }
+                case DELEGATE -> TlmFastPack.LOG.info("[TLM FastPack] {}", d.reason());
             }
         } catch (Throwable t) {
-            TlmFastPack.LOG.warn("[TLM FastPack] 跳过判定异常，放行上游全量拷贝: {}", t.toString());
+            TlmFastPack.LOG.warn("[TLM FastPack] 判定异常，放行上游全量拷贝: {}", t.toString());
         }
     }
 
     /**
      * RETURN（全部正常返回点）：上游拷贝完成后重建 marker + 清 reset 标记。
-     * 异常路径不会走到 RETURN → marker 不写 → 下次仍全拷（保守正确）。
+     * 我们自己 cancel 的路径由 ThreadLocal 去重（marker 已在快速通道里写过）。
      */
     @Inject(method = "copyFolder(Ljava/lang/String;Ljava/nio/file/Path;)V",
             at = @At("RETURN"), require = 0, expect = 0)
@@ -58,7 +70,6 @@ public abstract class FastPackMixin {
         try {
             PackState.afterFullCopy(resource, target);
         } catch (Throwable t) {
-            // 收尾失败只影响"下次能否跳过"，不影响本次游戏；但要留痕
             TlmFastPack.LOG.warn("[TLM FastPack] 收尾处理异常: {}", t.toString());
         }
     }

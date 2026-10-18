@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -392,8 +392,15 @@ public final class PackState {
                         }
                     }
                     Files.createDirectories(out.getParent());
-                    try (InputStream in = zf.getInputStream(e)) {
-                        Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
+                    // ★v1.1.1 关键修复：不用 REPLACE_EXISTING（它在 Windows 上是
+                    //   "DeleteFile0 删旧文件 + 建新文件"，本机删一个文件实测 2.6 秒——
+                    //   上游 TLM 慢的另一半根源就是它）。改为截断覆写，不碰删除路径。
+                    try (InputStream in = zf.getInputStream(e);
+                         OutputStream w = Files.newOutputStream(out,
+                                 StandardOpenOption.CREATE,
+                                 StandardOpenOption.TRUNCATE_EXISTING,
+                                 StandardOpenOption.WRITE)) {
+                        in.transferTo(w);
                     }
                     copied++;
                 }
